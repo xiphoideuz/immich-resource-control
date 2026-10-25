@@ -26,10 +26,11 @@ that hands the CPU back to other workloads when they need it.
 ```
 immich-resource-control/
 ├── scripts/
-│   ├── resource-control.sh    # interactive + non-interactive menu (ECO/PWR/AUTO)
-│   └── cpu-brake.sh           # per-minute emergency brake (auto mode only)
+│   ├── resource-control.sh    # interactive + non-interactive menu (ECO/PWR/AUTO + scheduling)
+│   └── cpu-brake.sh           # per-minute brake: dynamic in AUTO, cap enforcer in ECO/PWR
 ├── .brake-mode                # created on first run: AUTO | ECO | PWR
 ├── .brake-state               # brake internal state (level + calm counter)
+├── .brake-expire              # created only for scheduled ECO/PWR (epoch seconds)
 ├── cpu-brake.log              # brake audit log
 ├── AGENTS.md
 └── README.md
@@ -37,15 +38,43 @@ immich-resource-control/
 
 ## Modes
 
-| Mode | Job concurrency | CPU caps (server / ML) | Emergency brake |
-|------|----------------|------------------------|-----------------|
-| **ECO** | 1 for every queue | 0.5 / 0.25 cores | Disabled |
-| **PWR** | Immich defaults (thumb 3, meta 5, ML 2, …) | Unlimited (4/4) | Disabled |
-| **AUTO** | 1 for every queue | Released (3.5/3.0), brake decides | Active — measures *non-Immich* CPU load every minute via cron |
+| Mode | Job concurrency | CPU caps (server / ML) | What the brake does each minute |
+|------|----------------|------------------------|---------------------------------|
+| **ECO** | 1 for every queue | 0.5 / 0.25 cores | Re-asserts those caps if they drift (lock survives container recreation) |
+| **PWR** | Immich defaults (thumb 3, meta 5, ML 2, …) | Unlimited (4/4) | Re-asserts uncaps if they drift |
+| **AUTO** | 1 for every queue | Released (3.5/3.0), brake decides | Evaluates *non-Immich* CPU load: idle → release, light → throttle, heavy → curb |
 
-- **ECO** – for battery/heat-constrained hosts; Immich never steals CPU from anything else.
-- **PWR** – drain queues fast; fine when you own the machine.
-- **AUTO** – the daily driver: backlog drains when the machine is idle, and Immich pauses when something else runs.
+## Scheduling (ECO and PWR)
+
+Both ECO and PWR can be scheduled for a duration, after which the mode
+auto-reverts to **AUTO**:
+
+```bash
+# non-interactive
+resource-control.sh eco 4d11h9m   # ECO for 4 days 11 h 9 min, then AUTO
+resource-control.sh pwr 7h        # PWR for 7 hours, then AUTO
+resource-control.sh eco 20m       # ECO for 20 minutes, then AUTO
+resource-control.sh auto          # cancel any pending schedule immediately
+```
+
+Duration format: `4d11h9m` / `7h` / `20m` / `3d` / `1h30m` — days `d`,
+hours `h`, minutes `m`, seconds `s`, combinable.
+
+Interactively, press **E** or **P** and you'll be prompted:
+"Toggle to ECO [Enter] or Schedule ECO (input in format: 4d11h9m or 7h or 20m or 3d)?"
+Press Enter for immediate, or type a duration to schedule.
+
+The expiry is stored in `.brake-expire` (epoch seconds). The brake checks it
+every minute; once passed it flips the mode back to AUTO and re-releases the
+caps.
+
+## How a manual lock stays locked
+
+In ECO/PWR the brake doesn't just stand down — it enforces. Every minute it
+compares the live Docker CPU caps against the mode's pinned values and
+re-applies them if something (a `docker compose up` recreation, a manual
+`docker update`, a host reboot) drifted them. So once you lock ECO or PWR it
+stays locked until you switch modes or the schedule expires.
 
 ## Quick start
 
@@ -74,6 +103,13 @@ Non-interactively (good for cron or other automation):
 /opt/immich-resource-control/scripts/resource-control.sh eco
 /opt/immich-resource-control/scripts/resource-control.sh pwr
 /opt/immich-resource-control/scripts/resource-control.sh auto
+```
+
+With a duration:
+
+```bash
+/opt/immich-resource-control/scripts/resource-control.sh eco 20m
+/opt/immich-resource-control/scripts/resource-control.sh pwr 7h
 ```
 
 ### 3. Enable the automatic brake (AUTO mode)
